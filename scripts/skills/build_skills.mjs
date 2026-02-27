@@ -59,16 +59,33 @@ import { JSDoc, Project, SyntaxKind } from "ts-morph";
  * @property {string | null} componentModule
  */
 
+/**
+ * Build cache: input mtimes + outputs so we can skip work when inputs are unchanged.
+ * @typedef {Object} BuildCache
+ * @property {number} version
+ * @property {{ inputMtimes: Record<string, number>, data: Record<string, StoryEntry[]> }} [stories]
+ * @property {Record<string, { inputMtimes: Record<string, number>, name: string, deprecated: boolean, markdown: string }>} [components]
+ * @property {{ inputMtimes: Record<string, number>, files: Array<{ path: string, content: string }> }} [docs]
+ */
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "../..");
 const packageName = "carbon-sage";
 
 const checkMode = process.argv.includes("--check");
+const noCache = process.argv.includes("--no-cache");
 const buildOutputFolder = "lib";
 const indexFilePath = path.join(repoRoot, "src", "index.ts");
 const skillsRoot = path.join(repoRoot, "skills", "carbon-react");
 const componentsOutDir = path.join(skillsRoot, "components");
 const referencesDir = path.join(skillsRoot, "references", "docs");
+const buildCachePath = path.join(
+  repoRoot,
+  "node_modules",
+  ".cache",
+  "carbon-react",
+  "build-cache.json",
+);
 
 /** @type {string[]} */
 const docsReferenceFiles = [
@@ -87,16 +104,73 @@ const docsReferenceTargets = docsReferenceFiles.map(
     `references/docs/${path.basename(relativePath).replace(/\.mdx?$/, ".md")}`,
 );
 
+const CACHE_VERSION = 1;
+
+/**
+ * Get mtimes for a set of paths. Paths that don't exist are omitted.
+ * @param {string[]} filePaths
+ * @returns {Promise<Record<string, number>>}
+ */
+async function getFileMtimes(filePaths) {
+  const out = /** @type {Record<string, number>} */ ({});
+  for (const p of filePaths) {
+    try {
+      const s = await fs.stat(p);
+      out[p] = s.mtimeMs;
+    } catch {
+      // skip missing
+    }
+  }
+  return out;
+}
+
+/**
+ * @param {Record<string, number>} a
+ * @param {Record<string, number>} b
+ * @returns {boolean}
+ */
+function mtimesMatch(a, b) {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    if ((a[k] ?? 0) !== (b[k] ?? 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * @returns {Promise<BuildCache | null>}
+ */
+async function loadBuildCache() {
+  if (noCache) return null;
+  try {
+    const raw = await fs.readFile(buildCachePath, "utf8");
+    const data = JSON.parse(raw);
+    if (data?.version !== CACHE_VERSION) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {BuildCache} data
+ */
+async function saveBuildCache(data) {
+  try {
+    await fs.mkdir(path.dirname(buildCachePath), { recursive: true });
+    await fs.writeFile(buildCachePath, JSON.stringify(data), "utf8");
+  } catch (e) {
+    // eslint-disable-next-line no-console -- cache write is best-effort
+    console.warn("Could not write build cache:", e);
+  }
+}
+
 const project = new Project({
   tsConfigFilePath: path.join(repoRoot, "tsconfig.json"),
   skipAddingFilesFromTsConfig: true,
 });
 
 project.addSourceFileAtPath(indexFilePath);
-project.addSourceFilesAtPaths([
-  path.join(repoRoot, "src", "components", "**", "*.ts"),
-  path.join(repoRoot, "src", "components", "**", "*.tsx"),
-]);
 
 const indexFile = project.getSourceFileOrThrow(indexFilePath);
 
@@ -167,15 +241,17 @@ for (const exportDecl of indexFile.getExportDeclarations()) {
 /** @type {ComponentData[]} */
 const componentData = [];
 
+const buildCache = await loadBuildCache();
+
+// Resolve module path and files for each candidate (no project needed for paths)
+/** @type {Array<{ candidate: ComponentCandidate, modulePath: string, moduleFiles: string[] }>} */
+const candidateModules = [];
 for (const candidate of componentCandidates) {
   const modulePath = resolveModulePath(
     indexFilePath,
     candidate.moduleSpecifier,
   );
-  if (!modulePath) {
-    continue;
-  }
-
+  if (!modulePath) continue;
   const moduleDir = getModuleDir(modulePath);
   const moduleFiles = fg.sync(["**/*.{ts,tsx}"], {
     cwd: moduleDir,
@@ -189,11 +265,73 @@ for (const candidate of componentCandidates) {
       "**/__internal__/**",
     ],
   });
+  candidateModules.push({ candidate, modulePath, moduleFiles });
+}
 
-  for (const filePath of moduleFiles) {
+// Story data: use cache or extract
+const storyFiles = fg.sync(
+  ["src/**/*.stories.@(js|jsx|ts|tsx)", "docs/**/*.stories.@(js|jsx|ts|tsx)"],
+  { cwd: repoRoot, absolute: true },
+);
+const mdxFiles = fg.sync(["src/**/*.mdx", "docs/**/*.mdx"], {
+  cwd: repoRoot,
+  absolute: true,
+});
+const storyInputPaths = [...storyFiles, ...mdxFiles];
+const storyMtimes = await getFileMtimes(storyInputPaths);
+
+let storyDataByComponent;
+if (
+  buildCache?.stories &&
+  mtimesMatch(buildCache.stories.inputMtimes, storyMtimes)
+) {
+  storyDataByComponent = new Map(
+    Object.entries(buildCache.stories.data).map(([k, v]) => [k, v]),
+  );
+} else {
+  for (const filePath of storyInputPaths) {
     project.addSourceFileAtPathIfExists(filePath);
   }
+  storyDataByComponent = await extractStoryData(project, repoRoot);
+}
 
+// Component cache check and needExtract list
+/** @type {Array<{ candidate: ComponentCandidate, modulePath: string, moduleFiles: string[] }>} */
+const needExtract = [];
+/** @type {Map<string, { name: string, deprecated: boolean, markdown: string }>} */
+const cachedOutputs = new Map();
+/** @type {Map<string, Record<string, number>>} */
+const componentInputMtimes = new Map();
+
+for (const { candidate, modulePath, moduleFiles } of candidateModules) {
+  const inputPaths = [modulePath, ...moduleFiles];
+  const inputMtimes = await getFileMtimes(inputPaths);
+  const cacheKey = candidate.moduleSpecifier;
+  componentInputMtimes.set(cacheKey, inputMtimes);
+  const cached = buildCache?.components?.[cacheKey];
+  if (cached && mtimesMatch(cached.inputMtimes, inputMtimes)) {
+    cachedOutputs.set(cacheKey, {
+      name: cached.name,
+      deprecated: cached.deprecated,
+      markdown: cached.markdown,
+    });
+  } else {
+    needExtract.push({ candidate, modulePath, moduleFiles });
+  }
+}
+
+// Add only uncached component files to project and extract
+// When any component needs extraction, add all component module files so type
+// re-exports (e.g. AlertProps from Dialog) resolve correctly.
+if (needExtract.length > 0) {
+  for (const { moduleFiles } of candidateModules) {
+    for (const filePath of moduleFiles) {
+      project.addSourceFileAtPathIfExists(filePath);
+    }
+  }
+}
+
+for (const { candidate, modulePath, moduleFiles } of needExtract) {
   const propsName = `${candidate.name}Props`;
   const propsDefinition = resolvePropsDefinition(
     project,
@@ -201,8 +339,6 @@ for (const candidate of componentCandidates) {
     moduleFiles,
     propsName,
   );
-  // Use ts-morph to follow type re-exports (e.g., AlertProps -> DialogProps)
-  // so deprecated components still yield accurate props.
   const defaultsMap = collectDefaultProps(project, moduleFiles, candidate.name);
   const hasDefaultExport = moduleHasDefaultExport(project, modulePath);
   const deprecationInfo = detectDeprecation(
@@ -211,15 +347,11 @@ for (const candidate of componentCandidates) {
     moduleFiles,
     candidate.name,
   );
-
-  // Deprecation can be attached to the component export, its props interface,
-  // or a type alias, so we scan multiple nodes in detectDeprecation().
-
   const props = propsDefinition
     ? extractPropsFromDefinition(propsDefinition, defaultsMap)
     : [];
 
-  componentData.push({
+  const data = {
     name: candidate.displayName ?? candidate.name,
     moduleSpecifier: candidate.moduleSpecifier,
     props,
@@ -228,10 +360,26 @@ for (const candidate of componentCandidates) {
     hasDefaultExport,
     deprecated: deprecationInfo.deprecated,
     deprecationReason: deprecationInfo.reason,
+  };
+  componentData.push(data);
+  const stories = storyDataByComponent.get(data.name) ?? [];
+  const markdown = renderComponentMarkdown(data, stories);
+  cachedOutputs.set(candidate.moduleSpecifier, {
+    name: data.name,
+    deprecated: data.deprecated,
+    markdown,
   });
 }
 
-const storyDataByComponent = await extractStoryData(project, repoRoot);
+// Merge cached + fresh for consistent output: all entries by moduleSpecifier, sorted by name
+/** @type {Array<{ name: string, deprecated: boolean, markdown: string }>} */
+const mergedEntries = candidateModules
+  .map(({ candidate }) => cachedOutputs.get(candidate.moduleSpecifier))
+  .filter(
+    (/** @type {{ name: string, deprecated: boolean, markdown: string } | undefined} */ x) =>
+      x != null,
+  );
+mergedEntries.sort((a, b) => a.name.localeCompare(b.name));
 
 /** @type {Array<{path: string, content: string}>} */
 const wouldWrite = [];
@@ -260,23 +408,43 @@ for (const relativePath of docsReferenceFiles) {
 
 const indexLines = ["# Carbon Component Catalog", "", "## Components", ""];
 
-for (const component of componentData.sort((a, b) =>
-  a.name.localeCompare(b.name),
-)) {
-  const stories = storyDataByComponent.get(component.name) ?? [];
-  const fileName = `${toKebabCase(component.name)}.md`;
+for (const entry of mergedEntries) {
+  const fileName = `${toKebabCase(entry.name)}.md`;
   const filePath = path.join(componentsOutDir, fileName);
-  const markdown = renderComponentMarkdown(component, stories);
-
-  wouldWrite.push({ path: filePath, content: markdown });
-  const deprecatedLabel = component.deprecated ? " (deprecated)" : "";
+  wouldWrite.push({ path: filePath, content: entry.markdown });
+  const deprecatedLabel = entry.deprecated ? " (deprecated)" : "";
   indexLines.push(
-    `- [${component.name}](components/${fileName})${deprecatedLabel}`,
+    `- [${entry.name}](components/${fileName})${deprecatedLabel}`,
   );
 }
 
 const indexContent = indexLines.join("\n");
 wouldWrite.push({ path: path.join(skillsRoot, "index.md"), content: indexContent });
+
+if (!checkMode) {
+  const newCache = {
+    version: CACHE_VERSION,
+    stories: buildCache?.stories && mtimesMatch(buildCache.stories.inputMtimes, storyMtimes)
+      ? buildCache.stories
+      : {
+          inputMtimes: storyMtimes,
+          data: Object.fromEntries(storyDataByComponent.entries()),
+        },
+    components: {},
+  };
+  for (const { candidate } of candidateModules) {
+    const key = candidate.moduleSpecifier;
+    const out = cachedOutputs.get(key);
+    if (!out) continue;
+    const inputMtimes = componentInputMtimes.get(key);
+    const existing = buildCache?.components;
+    const fromCache = existing?.[key] && !needExtract.some((n) => n.candidate.moduleSpecifier === key);
+    newCache.components[key] = fromCache && existing?.[key]
+      ? existing[key]
+      : { inputMtimes: inputMtimes ?? {}, ...out };
+  }
+  await saveBuildCache(newCache);
+}
 
 if (checkMode) {
   const { hasDiff, diffSummary } = await checkWouldWrite(wouldWrite, {
@@ -292,7 +460,7 @@ if (checkMode) {
   }
   // eslint-disable-next-line no-console -- CI output
   console.log(
-    `Check passed: ${componentData.length} component skill files are up to date.`,
+    `Check passed: ${mergedEntries.length} component skill files are up to date.`,
   );
 } else {
   for (const { path: filePath, content } of wouldWrite) {
@@ -301,7 +469,7 @@ if (checkMode) {
   }
   // eslint-disable-next-line no-console -- Log summary of generated components and output location
   console.log(
-    `Generated ${componentData.length} component skill files in ${path.relative(
+    `Generated ${mergedEntries.length} component skill files in ${path.relative(
       repoRoot,
       componentsOutDir,
     )}`,
